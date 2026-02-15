@@ -77,7 +77,14 @@ static uint32_t EMU_SLIX2_BLOCKS[SLIX2_BLOCKS];
 static uint16_t EMU_SLIX2_COUNTER;
 static bool     EMU_SLIX2_TAG_PRESENT;
 
-static uint32_t EMU_UIDPrngNext(void) {
+// Flash storage for selected tag pair index (append-only records in reserved last flash page).
+#define EMU_TAG_PAIR_FLASH_PAGE_SIZE      1024u
+#define EMU_TAG_PAIR_FLASH_BASE_ADDR      0x08000000u
+#define EMU_TAG_PAIR_FLASH_EMPTY_RECORD   0xFFFFFFFFu
+#define EMU_TAG_PAIR_FLASH_RECORD_MAGIC   0xA5u
+#define EMU_TAG_PAIR_FLASH_RECORD_TAIL    0x5Au
+
+static uint32_t EMU_TagPairPrngNext(void) {
   static uint32_t state = 0;
   if(0 == state) {
     state = HAL_GetTick() ^ SysTick->VAL ^ (uint32_t)(uintptr_t)&state;
@@ -87,20 +94,131 @@ static uint32_t EMU_UIDPrngNext(void) {
     state ^= *(uint32_t*)(UID_BASE + 8);
 #endif
     if(0 == state)
-      state = 0xA5F10C3Du;
+      state = 0x9E3779B9u;
   }
 
-  // xorshift32 PRNG: sufficient for non-cryptographic UID randomization
   state ^= state << 13;
   state ^= state >> 17;
   state ^= state << 5;
   return state;
 }
 
-static void EMU_SLIX2_RandomizeInventoryUID(void) {
-  for(uint8_t i=1; i<SLIX2_INVENTORY_LEN; i++) {
-    EMU_SLIX2_INVENTORY[i] = (uint8_t)EMU_UIDPrngNext();
+static uint32_t EMU_TagPairFlashPageAddress(void) {
+  uint16_t flash_kb = *(uint16_t*)FLASHSIZE_BASE;
+  if( (0 == flash_kb) || (0xFFFFu == flash_kb) )
+    flash_kb = 64;
+
+  uint32_t flash_size = (uint32_t)flash_kb * 1024u;
+  return (EMU_TAG_PAIR_FLASH_BASE_ADDR + flash_size - EMU_TAG_PAIR_FLASH_PAGE_SIZE);
+}
+
+static uint32_t EMU_TagPairMakeFlashRecord(const uint8_t next_index) {
+  return (((uint32_t)EMU_TAG_PAIR_FLASH_RECORD_MAGIC) << 24) |
+         (((uint32_t)next_index) << 16) |
+         (((uint32_t)(uint8_t)(~next_index)) << 8) |
+         ((uint32_t)EMU_TAG_PAIR_FLASH_RECORD_TAIL);
+}
+
+static bool EMU_TagPairParseFlashRecord(const uint32_t record, uint8_t* p_next_index) {
+  if( EMU_TAG_PAIR_FLASH_EMPTY_RECORD == record )
+    return false;
+
+  if( ((uint8_t)(record >> 24) != EMU_TAG_PAIR_FLASH_RECORD_MAGIC) ||
+      ((uint8_t)(record >> 0)  != EMU_TAG_PAIR_FLASH_RECORD_TAIL) )
+    return false;
+
+  uint8_t next = (uint8_t)(record >> 16);
+  uint8_t inv = (uint8_t)(record >> 8);
+  if( (uint8_t)(~next) != inv )
+    return false;
+
+  if( next >= DMO_TAG_EMU_PAIRS_COUNT )
+    return false;
+
+  if( NULL != p_next_index )
+    *p_next_index = next;
+
+  return true;
+}
+
+static bool EMU_TagPairLoadNextIndex(uint8_t* p_index) {
+  if( NULL == p_index )
+    return false;
+
+  uint32_t page_addr = EMU_TagPairFlashPageAddress();
+  uint32_t slots = EMU_TAG_PAIR_FLASH_PAGE_SIZE / sizeof(uint32_t);
+
+  bool found = false;
+  uint8_t last_next = 0;
+
+  for(uint32_t i=0; i<slots; i++) {
+    uint32_t record = *(volatile uint32_t*)(page_addr + i*sizeof(uint32_t));
+    if( EMU_TAG_PAIR_FLASH_EMPTY_RECORD == record )
+      break;
+
+    uint8_t next = 0;
+    if( EMU_TagPairParseFlashRecord(record, &next) ) {
+      last_next = next;
+      found = true;
+    }
   }
+
+  if( found ) {
+    *p_index = last_next;
+    return true;
+  }
+
+  return false;
+}
+
+static bool EMU_TagPairStoreNextIndex(const uint8_t used_index) {
+  uint8_t next_index = (uint8_t)((used_index + 1u) % DMO_TAG_EMU_PAIRS_COUNT);
+  uint32_t new_record = EMU_TagPairMakeFlashRecord(next_index);
+  uint32_t page_addr = EMU_TagPairFlashPageAddress();
+  uint32_t slots = EMU_TAG_PAIR_FLASH_PAGE_SIZE / sizeof(uint32_t);
+
+  uint32_t write_addr = 0;
+  bool slot_found = false;
+  for(uint32_t i=0; i<slots; i++) {
+    uint32_t addr = page_addr + i*sizeof(uint32_t);
+    if( EMU_TAG_PAIR_FLASH_EMPTY_RECORD == *(volatile uint32_t*)addr ) {
+      write_addr = addr;
+      slot_found = true;
+      break;
+    }
+  }
+
+  HAL_FLASH_Unlock();
+
+  if( !slot_found ) {
+    FLASH_EraseInitTypeDef erase = {
+      .TypeErase = FLASH_TYPEERASE_PAGES,
+      .PageAddress = page_addr,
+      .NbPages = 1
+    };
+    uint32_t page_error = 0;
+    if( HAL_OK != HAL_FLASHEx_Erase(&erase, &page_error) ) {
+      HAL_FLASH_Lock();
+      return false;
+    }
+    write_addr = page_addr;
+  }
+
+  if( HAL_OK != HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, write_addr, new_record) ) {
+    HAL_FLASH_Lock();
+    return false;
+  }
+
+  HAL_FLASH_Lock();
+  return true;
+}
+
+static uint8_t EMU_TagPairChooseBootIndex(void) {
+  uint8_t index = 0;
+  if( EMU_TagPairLoadNextIndex(&index) )
+    return index;
+
+  return (uint8_t)(EMU_TagPairPrngNext() % DMO_TAG_EMU_PAIRS_COUNT);
 }
 
 static void EMU_SLIX2_SyncSysInfoWithInventoryUID(void) {
@@ -246,12 +364,16 @@ void EMU_CLRC688_Communication(const uint8_t* pindata, const uint8_t inlength, u
 }
 
 void InitEmulationWithDefaultData(void) {
-  // generate UID at startup and mirror UID bytes into sysinfo
+  uint8_t pair_index = EMU_TagPairChooseBootIndex();
+  const DmoTagEmuPair* pair = &DMO_TAG_EMU_PAIRS[pair_index];
+  (void)EMU_TagPairStoreNextIndex(pair_index);
+
+  // use the selected UID+signature pair and mirror UID bytes into sysinfo
   EMU_SLIX2_INVENTORY[0] = 0x01;
-  EMU_SLIX2_RandomizeInventoryUID();
+  memcpy(EMU_SLIX2_INVENTORY + 1, pair->uid, 8);
   EMU_SLIX2_SyncSysInfoWithInventoryUID();
   memcpy(EMU_SLIX2_NXPSYSINFO, DMO_TAG_SLIX2_NXPSYSINFO, SLIX2_NXPSYSINFO_LEN); 
-  memcpy(EMU_SLIX2_SIGNATURE,  DMO_TAG_SLIX2_SIGNATURE, SLIX2_SIGNATURE_LEN); 
+  memcpy(EMU_SLIX2_SIGNATURE, pair->signature, SLIX2_SIGNATURE_LEN); 
 
   const DmoSku* sku = DMO_FindSkuByName(DEFAULT_DMO_SKU_NAME);
   if( sku == NULL && DMO_SKUS_COUNT > 0 )
