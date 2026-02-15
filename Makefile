@@ -2,7 +2,7 @@
 BUILD_DIR = build
 TARGET = freedmo
 #DEBUG = 1
-OPT = -std=c99 -Wall -Os -DDMO_SKU_$(DMO_SKU)
+OPT = -std=c99 -Wall -Os
 
 ######################################
 # source
@@ -26,7 +26,10 @@ Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_flash_ex.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_exti.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_tim.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_tim_ex.c \
-Src/system_stm32f1xx.c  
+Src/system_stm32f1xx.c  \
+Src/dmo_skus.c  \
+Src/tag_emu_signature.c \
+Src/rfid_scanner.c  
 
 # ASM sources
 ASM_SOURCES =  \
