@@ -783,8 +783,12 @@ void HAL_I2C_ListenCpltCallback(I2C_HandleTypeDef *hi2c) {
 }
 
 void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
-  ESP_DebugState.i2c_error_count++;
-  ESP_DebugQueueI2CError(hi2c->ErrorCode);
+  const uint32_t err = hi2c->ErrorCode;
+  const uint32_t unexpected = (err & (~HAL_I2C_ERROR_AF));
+  if( 0u != unexpected ) {
+    ESP_DebugState.i2c_error_count++;
+    ESP_DebugQueueI2CError(err);
+  }
   HAL_I2C_EnableListen_IT(hi2c);
 }
 //
