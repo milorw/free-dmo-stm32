@@ -1,0 +1,10 @@
+# STM32 build artifacts
+stm32/build/
+
+# ESP-IDF build artifacts
+esp32-c3/build/
+esp32-c3/sdkconfig
+esp32-c3/sdkconfig.old
+
+# Generic
+*.swp

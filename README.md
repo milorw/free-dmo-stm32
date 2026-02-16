@@ -4,6 +4,11 @@ Endless freedom for D.MO 550 series label writer printer.
 
 [![Release](https://img.shields.io/github/release/free-dmo/free-dmo-stm32.svg?maxAge=60)](https://github.com/free-dmo/free-dmo-stm32/releases/latest) <== Click here to download
 
+## Repository layout
+
+- `stm32/`: existing STM32 firmware project (Makefile/CubeMX layout).
+- `esp32-c3/`: ESP-IDF companion firmware project for serial bridge work.
+
 ## Wiring
 
 Components needed:
@@ -26,13 +31,13 @@ The left cable goes to the RFID board, the right cable goes to the main board of
 *Attaching the RFID board is optional.* If you only want to emulate one specific label type you don't have to connect the RFID board and 2 x 4k7Ω resistors.
 
 STM32F103 blue pill:
-![BLUE PILL](ASSEMBLY_PICTURES/i4.jpg)
+![BLUE PILL](stm32/ASSEMBLY_PICTURES/i4.jpg)
 
 Connection to RFID board:
-![RFID BOARD](ASSEMBLY_PICTURES/i3.jpg)
+![RFID BOARD](stm32/ASSEMBLY_PICTURES/i3.jpg)
 
 Connection to main board:
-![MAIN BOARD](ASSEMBLY_PICTURES/i2.jpg)
+![MAIN BOARD](stm32/ASSEMBLY_PICTURES/i2.jpg)
 
 
 ## Firmware
@@ -41,16 +46,16 @@ Option 1: Install the required ARM toolchain from distribution
 
  * install the ARM toolchain from distribution (e.g. on Debian-based GNU/Linux install the gcc-arm-none-eabi and libnewlib-arm-none-eabi packages)
 
- * run `make` to compile the firmware
+ * run `make stm32` (or `make`) to compile the firmware
 
 Option 2: Install required ARM toolchain GNU Arm Embedded Toolchain from ARM: 
 
  * download and unpack from here: https://developer.arm.com/tools-and-software/open-source-software/developer-tools/gnu-toolchain/gnu-rm/downloads
 
- * open the Makefile and modify the first line `GCC_PATH` to point to the GNU ARM embedded toolchain `bin` folder<br/>
+ * open `stm32/Makefile` and modify the first line `GCC_PATH` to point to the GNU ARM embedded toolchain `bin` folder<br/>
    e.g. `GCC_PATH = ../gcc-arm-none-eabi-10.3-2021.07`
 
- * run `make` to compile the firmware
+ * run `make stm32` (or `make`) to compile the firmware
 
 Option 3: Use the precompiled firmware 
 
@@ -60,7 +65,7 @@ Option 3: Use the precompiled firmware
 
 ## Download the firmware to the STM32F103 bluepill board
 
- * after compilation you can find the firmware file `freedmo.bin` in the `build` folder
+ * after compilation you can find the firmware file `freedmo.bin` in the `stm32/build` folder
 
  * you can write the firmware via 
 
@@ -79,7 +84,7 @@ The project comes with the CubeMX .ioc file which can be used to modify pins and
 
 
 ### STM32F103 pin assignment
-![CUBEMX](ASSEMBLY_PICTURES/i1.png)
+![CUBEMX](stm32/ASSEMBLY_PICTURES/i1.png)
 
 ## D.MO RFID tag emulation
 
@@ -94,7 +99,7 @@ D.MO uses it's own Originality Signature (own signing key) which is used to sign
 This is used to only allow D.MO's own SLIX2 tags. However when you can emulate the UID you also can emulate the corresponding signature bytes, you just need to dump them from a valid tag.<br/>(see: https://github.com/free-dmo/free-dmo-tag-dump).
 
 The firmware contains some D.MO SLIX2 tag dumps which you can choose from: <br/>
-file: `Src/main.c`
+file: `stm32/Src/main.c`
 
 ~~~ C
 #define SLIX2_TAG_EMU 1
@@ -108,7 +113,7 @@ The data about the labels (SKU, size, count, ...) is encoded in the standard SLI
 **Inside of this data is no dependency to the UID or signature**. This enables a "mix and match" of SLIX2 tag (UID+signature) and the media data used from the printer. Unfortunately the encoded data uses an unknown CRC32 algorithm which limits us to use existing dumped label formats only.
 
 You can choose from the list of included label data by selecting the SKU: <br/>
-file: `Src/main.c`
+file: `stm32/Src/main.c`
 
 ~~~ C
 #define DMO_SKU_S0722430 // 54 x 101 mm, 220 pcs.

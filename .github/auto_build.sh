@@ -6,7 +6,7 @@ set -x
 build_sku () {
   SKU=$1
   make clean all DMO_SKU=${SKU}
-  cp build/freedmo.bin freedmo-default-sku-${SKU}.bin
+  cp stm32/build/freedmo.bin freedmo-default-sku-${SKU}.bin
 }
 
 build_sku S0722370
