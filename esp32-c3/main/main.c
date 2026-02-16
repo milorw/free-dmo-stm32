@@ -14,16 +14,19 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_netif_ip_addr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lwip/ip4_addr.h"
 #include "nvs_flash.h"
 #include "free_dmo_config.h"
 
-#define AP_CHANNEL 6
-#define AP_MAX_CONN 4
-
-#define AP_SSID FREE_DMO_CFG_ESP_AP_SSID
+#define WIFI_STA_SSID FREE_DMO_CFG_ESP_WIFI_STA_SSID
+#define WIFI_STA_PASSWORD FREE_DMO_CFG_ESP_WIFI_STA_PASSWORD
+#define WIFI_STATIC_IP FREE_DMO_CFG_ESP_WIFI_STATIC_IP
+#define WIFI_STATIC_GATEWAY FREE_DMO_CFG_ESP_WIFI_STATIC_GATEWAY
+#define WIFI_STATIC_NETMASK FREE_DMO_CFG_ESP_WIFI_STATIC_NETMASK
 
 #define STM_UART_NUM ((uart_port_t)FREE_DMO_CFG_ESP_STM_UART_NUM)
 #define STM_UART_TX_GPIO ((gpio_num_t)FREE_DMO_CFG_ESP_STM_UART_TX_GPIO)
@@ -66,6 +69,7 @@ static bool g_debug_enabled = false;
 static volatile bool g_flash_in_progress = false;
 static bool g_last_flash_ok = false;
 static uint32_t g_last_flash_bytes = 0;
+static bool g_wifi_connected = false;
 
 static uint32_t g_stm_line_count = 0;
 static uint32_t g_stm_byte_count = 0;
@@ -125,7 +129,7 @@ static const char INDEX_HTML[] =
     "function updateBtn(){debugBtn.textContent=debugOn?'Disable Debug':'Enable Debug';debugBtn.className=debugOn?'primary':'warn';debugBtn.disabled=flashing;flashBtn.disabled=flashing;}"
     "function setStatus(s){statusEl.textContent=s;}"
     "function setFlashState(s){flashStateEl.textContent=s;}"
-    "function refreshState(){fetch('/api/state').then(function(r){return r.json();}).then(function(s){debugOn=!!s.debug;flashing=!!s.flashing;updateBtn();setStatus('Wi-Fi AP: " AP_SSID " @ 192.168.4.1 | Debug: '+(debugOn?'ON':'OFF')+' | Flash: '+(flashing?'BUSY':'IDLE')+' | STM lines: '+s.lines+' | bytes: '+s.bytes);if(flashing){setFlashState('Flashing in progress. Do not power-cycle devices.');}else if(s.last_flash_bytes>0){setFlashState('Last flash '+(s.last_flash_ok?'OK':'FAILED')+' ('+s.last_flash_bytes+' bytes).');}}).catch(function(){setStatus('Disconnected from ESP.');});}"
+    "function refreshState(){fetch('/api/state').then(function(r){return r.json();}).then(function(s){debugOn=!!s.debug;flashing=!!s.flashing;updateBtn();setStatus('Wi-Fi STA: " WIFI_STA_SSID " @ " WIFI_STATIC_IP " | Link: '+(s.wifi?'UP':'DOWN')+' | Debug: '+(debugOn?'ON':'OFF')+' | Flash: '+(flashing?'BUSY':'IDLE')+' | STM lines: '+s.lines+' | bytes: '+s.bytes);if(flashing){setFlashState('Flashing in progress. Do not power-cycle devices.');}else if(s.last_flash_bytes>0){setFlashState('Last flash '+(s.last_flash_ok?'OK':'FAILED')+' ('+s.last_flash_bytes+' bytes).');}}).catch(function(){setStatus('Disconnected from ESP.');});}"
     "function refreshLogs(){fetch('/api/logs').then(function(r){return r.text();}).then(function(t){if(t!==lastLogs){lastLogs=t;logsEl.textContent=t;logsEl.scrollTop=logsEl.scrollHeight;}}).catch(function(){});}" 
     "debugBtn.onclick=function(){var body=debugOn?'0':'1';fetch('/api/debug',{method:'POST',body:body}).then(function(){refreshState();refreshLogs();});};"
     "flashBtn.onclick=function(){if(flashing){return;}if(!fwFileEl.files||!fwFileEl.files.length){setFlashState('Choose a .bin file first.');return;}var file=fwFileEl.files[0];if(file.size>65536){setFlashState('Firmware too large for STM32F103C8 (max 65536 bytes).');return;}setFlashState('Uploading '+file.name+' ('+file.size+' bytes)...');fetch('/api/flash',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file}).then(function(resp){return resp.text().then(function(text){return{ok:resp.ok,text:text};});}).then(function(result){var obj=null;try{obj=JSON.parse(result.text);}catch(e){}if(result.ok&&obj&&obj.ok){setFlashState('Flash complete: '+obj.bytes+' bytes.');}else if(obj&&obj.error){setFlashState('Flash failed: '+obj.error);}else{setFlashState('Flash failed.');}refreshState();refreshLogs();}).catch(function(){setFlashState('Flash request failed.');});};"
@@ -642,15 +646,16 @@ static esp_err_t api_logs_get_handler(httpd_req_t *req)
 
 static esp_err_t api_state_get_handler(httpd_req_t *req)
 {
-    char json[196];
+    char json[224];
     snprintf(json, sizeof(json),
-             "{\"debug\":%d,\"lines\":%lu,\"bytes\":%lu,\"flashing\":%d,\"last_flash_ok\":%d,\"last_flash_bytes\":%lu}",
+             "{\"debug\":%d,\"lines\":%lu,\"bytes\":%lu,\"flashing\":%d,\"last_flash_ok\":%d,\"last_flash_bytes\":%lu,\"wifi\":%d}",
              g_debug_enabled ? 1 : 0,
              (unsigned long)g_stm_line_count,
              (unsigned long)g_stm_byte_count,
              g_flash_in_progress ? 1 : 0,
              g_last_flash_ok ? 1 : 0,
-             (unsigned long)g_last_flash_bytes);
+             (unsigned long)g_last_flash_bytes,
+             g_wifi_connected ? 1 : 0);
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
@@ -787,32 +792,68 @@ static httpd_handle_t start_webserver(void)
     return server;
 }
 
-static void wifi_init_softap(void)
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+    (void)event_data;
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        g_wifi_connected = false;
+        esp_wifi_connect();
+        push_log_line("[esp] wifi disconnected; reconnecting");
+        return;
+    }
+
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        g_wifi_connected = true;
+        const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "STA got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        push_logf("[esp] wifi up: " IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+static void wifi_init_sta(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    ESP_ERROR_CHECK(sta_netif != NULL ? ESP_OK : ESP_FAIL);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    wifi_config_t wifi_config = {
-        .ap = {
-            .channel = AP_CHANNEL,
-            .max_connection = AP_MAX_CONN,
-            .authmode = WIFI_AUTH_OPEN,
-            .pmf_cfg = {
-                .required = false,
-            },
-        },
-    };
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
-    memcpy(wifi_config.ap.ssid, AP_SSID, strlen(AP_SSID));
-    wifi_config.ap.ssid_len = strlen(AP_SSID);
+    ESP_ERROR_CHECK(esp_netif_dhcpc_stop(sta_netif));
+    esp_netif_ip_info_t ip_info = {0};
+    ip4_addr_t ip = {0};
+    ip4_addr_t gw = {0};
+    ip4_addr_t netmask = {0};
+    ESP_ERROR_CHECK(ip4addr_aton(WIFI_STATIC_IP, &ip) ? ESP_OK : ESP_ERR_INVALID_ARG);
+    ESP_ERROR_CHECK(ip4addr_aton(WIFI_STATIC_GATEWAY, &gw) ? ESP_OK : ESP_ERR_INVALID_ARG);
+    ESP_ERROR_CHECK(ip4addr_aton(WIFI_STATIC_NETMASK, &netmask) ? ESP_OK : ESP_ERR_INVALID_ARG);
+    ip_info.ip.addr = ip.addr;
+    ip_info.gw.addr = gw.addr;
+    ip_info.netmask.addr = netmask.addr;
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(sta_netif, &ip_info));
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    wifi_config_t wifi_config = {0};
+    memcpy(wifi_config.sta.ssid, WIFI_STA_SSID, strlen(WIFI_STA_SSID));
+    memcpy(wifi_config.sta.password, WIFI_STA_PASSWORD, strlen(WIFI_STA_PASSWORD));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.pmf_cfg.capable = true;
+    wifi_config.sta.pmf_cfg.required = false;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 }
 
 static void handle_stm_line(char *line)
@@ -890,12 +931,13 @@ void app_main(void)
 
     stm_uart_init();
     stm_boot_pins_init();
-    wifi_init_softap();
+    wifi_init_sta();
     (void)start_webserver();
 
-    ESP_LOGI(TAG, "Web console ready: connect to AP '%s' then open http://192.168.4.1", AP_SSID);
+    ESP_LOGI(TAG, "Web console ready: join '%s' and open http://" WIFI_STATIC_IP, WIFI_STA_SSID);
     push_log_line("[esp] boot complete");
-    push_log_line("[esp] web console available at http://192.168.4.1");
+    push_logf("[esp] target wifi ssid: %s", WIFI_STA_SSID);
+    push_log_line("[esp] web console available at http://" WIFI_STATIC_IP);
     push_logf("[esp] stm flash pins: BOOT0=GPIO%u NRST=GPIO%u",
               (unsigned)FREE_DMO_CFG_ESP_STM_BOOT0_GPIO,
               (unsigned)FREE_DMO_CFG_ESP_STM_RESET_GPIO);

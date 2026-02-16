@@ -10,8 +10,17 @@
 
 /* ----------------------------- ESP32-C3 config ---------------------------- */
 
-/* SoftAP SSID used by the ESP32 web UI. */
-#define FREE_DMO_CFG_ESP_AP_SSID "free-dmo-debug"
+/*
+ * Existing Wi-Fi network credentials used by ESP32 station mode.
+ * The ESP joins this network and serves the web UI on the static IP below.
+ */
+#define FREE_DMO_CFG_ESP_WIFI_STA_SSID     "your-wifi-ssid"
+#define FREE_DMO_CFG_ESP_WIFI_STA_PASSWORD "your-wifi-password"
+
+/* Static IPv4 configuration used by ESP32 station mode. */
+#define FREE_DMO_CFG_ESP_WIFI_STATIC_IP      "192.168.68.112"
+#define FREE_DMO_CFG_ESP_WIFI_STATIC_GATEWAY "192.168.68.1"
+#define FREE_DMO_CFG_ESP_WIFI_STATIC_NETMASK "255.255.252.0"
 
 /* UART link from ESP32-C3 to STM32 (ESP side numbering). */
 #define FREE_DMO_CFG_ESP_STM_UART_NUM      1
