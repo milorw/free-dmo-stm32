@@ -126,6 +126,10 @@ static uint8_t  EMU_SLIX2_SIGNATURE[SLIX2_SIGNATURE_LEN];
 static uint32_t EMU_SLIX2_BLOCKS[SLIX2_BLOCKS];
 static uint16_t EMU_SLIX2_COUNTER;
 static bool     EMU_SLIX2_TAG_PRESENT;
+static volatile bool EMU_TagPairCycleOnWakePending;
+static volatile bool EMU_TagPairRandomizePending;
+static uint8_t EMU_TagPairCurrentIndex;
+static void ESP_UART_Sendf(const char* fmt, ...);
 
 // Flash storage for selected tag pair index (append-only records in reserved last flash page).
 #define EMU_TAG_PAIR_FLASH_PAGE_SIZE      1024u
@@ -275,9 +279,61 @@ static uint8_t EMU_TagPairChooseBootIndex(void) {
 #endif
 }
 
+static uint8_t EMU_TagPairChooseCycleIndex(void) {
+#if (FREE_DMO_CFG_STM_UID_SIG_MODE_RANDOM == 0)
+  return (uint8_t)(FREE_DMO_CFG_STM_UID_SIG_FIXED_INDEX % DMO_TAG_EMU_PAIRS_COUNT);
+#else
+  uint8_t index = 0;
+  if( EMU_TagPairLoadNextIndex(&index) )
+    return index;
+  return (uint8_t)((EMU_TagPairCurrentIndex + 1u) % DMO_TAG_EMU_PAIRS_COUNT);
+#endif
+}
+
+static uint8_t EMU_TagPairChooseRandomIndex(void) {
+#if (FREE_DMO_CFG_STM_UID_SIG_MODE_RANDOM == 0)
+  return (uint8_t)(FREE_DMO_CFG_STM_UID_SIG_FIXED_INDEX % DMO_TAG_EMU_PAIRS_COUNT);
+#else
+  return (uint8_t)(EMU_TagPairPrngNext() % DMO_TAG_EMU_PAIRS_COUNT);
+#endif
+}
+
 static void EMU_SLIX2_SyncSysInfoWithInventoryUID(void) {
   memcpy(EMU_SLIX2_SYSINFO, DMO_TAG_SLIX2_SYSINFO_TEMPLATE, SLIX2_SYSINFO_LEN);
   memcpy(EMU_SLIX2_SYSINFO + 1, EMU_SLIX2_INVENTORY + 1, 8);
+}
+
+static void EMU_TagPairApply(const uint8_t pair_index, const bool store_next, const char* reason) {
+  const DmoTagEmuPair* pair = &DMO_TAG_EMU_PAIRS[pair_index];
+  EMU_TagPairCurrentIndex = pair_index;
+
+  EMU_SLIX2_INVENTORY[0] = 0x01;
+  memcpy(EMU_SLIX2_INVENTORY + 1, pair->uid, 8);
+  EMU_SLIX2_SyncSysInfoWithInventoryUID();
+  memcpy(EMU_SLIX2_NXPSYSINFO, DMO_TAG_SLIX2_NXPSYSINFO, SLIX2_NXPSYSINFO_LEN);
+  memcpy(EMU_SLIX2_SIGNATURE, pair->signature, SLIX2_SIGNATURE_LEN);
+
+#if (FREE_DMO_CFG_STM_UID_SIG_MODE_RANDOM != 0)
+  if( store_next )
+    (void)EMU_TagPairStoreNextIndex(pair_index);
+#else
+  (void)store_next;
+#endif
+
+  if( NULL != reason )
+    ESP_UART_Sendf("INFO:uidsig idx=%u source=%s", (unsigned)pair_index, reason);
+}
+
+static void EMU_TagPairServicePendingRequests(void) {
+  if( EMU_TagPairRandomizePending ) {
+    EMU_TagPairRandomizePending = false;
+    EMU_TagPairApply(EMU_TagPairChooseRandomIndex(), true, "cmd-random");
+  }
+
+  if( EMU_TagPairCycleOnWakePending ) {
+    EMU_TagPairCycleOnWakePending = false;
+    EMU_TagPairApply(EMU_TagPairChooseCycleIndex(), true, "wake");
+  }
 }
 
 static void ESP_UART_SendByte(const uint8_t value) {
@@ -484,6 +540,10 @@ static void ESP_UART_HandleCommand(const char* cmd) {
   }
   else if( 0 == strcmp(cmd, "CMD:DEBUG:0") ) {
     ESP_DebugSetEnabled(false);
+  }
+  else if( 0 == strcmp(cmd, "CMD:UIDSIG:RANDOM") ) {
+    EMU_TagPairRandomizePending = true;
+    ESP_UART_SendLine("ACK:UIDSIG:RANDOM");
   }
   else if( 0 == strcmp(cmd, "CMD:PING") ) {
     ESP_UART_SendLine("ACK:PONG");
@@ -696,17 +756,7 @@ void EMU_CLRC688_Communication(const uint8_t* pindata, const uint8_t inlength, u
 
 void InitEmulationWithDefaultData(void) {
   uint8_t pair_index = EMU_TagPairChooseBootIndex();
-  const DmoTagEmuPair* pair = &DMO_TAG_EMU_PAIRS[pair_index];
-#if (FREE_DMO_CFG_STM_UID_SIG_MODE_RANDOM != 0)
-  (void)EMU_TagPairStoreNextIndex(pair_index);
-#endif
-
-  // use the selected UID+signature pair and mirror UID bytes into sysinfo
-  EMU_SLIX2_INVENTORY[0] = 0x01;
-  memcpy(EMU_SLIX2_INVENTORY + 1, pair->uid, 8);
-  EMU_SLIX2_SyncSysInfoWithInventoryUID();
-  memcpy(EMU_SLIX2_NXPSYSINFO, DMO_TAG_SLIX2_NXPSYSINFO, SLIX2_NXPSYSINFO_LEN); 
-  memcpy(EMU_SLIX2_SIGNATURE, pair->signature, SLIX2_SIGNATURE_LEN); 
+  EMU_TagPairApply(pair_index, false, "boot");
 
   const DmoSku* sku = DMO_FindSkuByName(DEFAULT_DMO_SKU_NAME);
   if( sku == NULL && DMO_SKUS_COUNT > 0 )
@@ -722,14 +772,16 @@ void InitEmulationWithDefaultData(void) {
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   static uint8_t clrc668_pwr_state = 1;
+  (void)GPIO_Pin;
 
   uint8_t pdown = HAL_GPIO_ReadPin(EXTI0_IN_PWDN_GPIO_Port,EXTI0_IN_PWDN_Pin);
   if( pdown == clrc668_pwr_state )
     return;
 
-  if( !pdown )
+  if( !pdown ) {
+    EMU_TagPairCycleOnWakePending = true;
     HAL_I2C_EnableListen_IT(&hi2c1);  //power up
-  else {
+  } else {
     HAL_I2C_DisableListen_IT(&hi2c1); //power down
     HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN1);
     HAL_PWR_EnterSTANDBYMode();
@@ -830,7 +882,7 @@ int main(void)
   ESP_UART_Init();
   ESP_DebugSetEnabled(FREE_DMO_CFG_STM_DEBUG_DEFAULT_ENABLED ? true : false);
   ESP_UART_SendLine("FREE-DMO STM32 bridge online");
-  ESP_UART_SendLine("INFO:commands CMD:DEBUG:1 CMD:DEBUG:0 CMD:PING");
+  ESP_UART_SendLine("INFO:commands CMD:DEBUG:1 CMD:DEBUG:0 CMD:UIDSIG:RANDOM CMD:PING");
 
   //start listening as I2C slave
   HAL_I2C_EnableListen_IT(&hi2c1);
@@ -839,6 +891,7 @@ int main(void)
   uint32_t rfid_next_tick = HAL_GetTick();
   for(;;) {
     ESP_UART_PollCommands();
+    EMU_TagPairServicePendingRequests();
     ESP_DebugSendPeriodicStatus();
     ESP_DebugDrainEvents();
 

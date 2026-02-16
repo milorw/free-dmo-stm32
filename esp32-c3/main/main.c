@@ -113,6 +113,7 @@ static const char INDEX_HTML[] =
     "<label>UID/Signature Pair (coming soon)</label><select disabled><option>Not implemented yet</option></select><br><br>"
     "<label>Additional Settings (coming soon)</label><input disabled value='Not implemented yet'><br><br>"
     "<button id='debugBtn' class='warn'>Enable Debug</button> "
+    "<button id='randomizeBtn'>Randomize UID/Signature</button> "
     "<a href='/logs' download><button>Download Logs</button></a>"
     "<p><small>When enabled, STM32 debug + I2C trace forwarding will be shown here once STM firmware support is added.</small></p>"
     "<hr style='border-color:#2c3a4d'>"
@@ -127,6 +128,7 @@ static const char INDEX_HTML[] =
     "<script>"
     "var statusEl=document.getElementById('status');"
     "var debugBtn=document.getElementById('debugBtn');"
+    "var randomizeBtn=document.getElementById('randomizeBtn');"
     "var flashBtn=document.getElementById('flashBtn');"
     "var fwFileEl=document.getElementById('fwFile');"
     "var flashStateEl=document.getElementById('flashState');"
@@ -134,12 +136,13 @@ static const char INDEX_HTML[] =
     "var debugOn=false;"
     "var flashing=false;"
     "var lastLogs='';"
-    "function updateBtn(){debugBtn.textContent=debugOn?'Disable Debug':'Enable Debug';debugBtn.className=debugOn?'primary':'warn';debugBtn.disabled=flashing;flashBtn.disabled=flashing;}"
+    "function updateBtn(){debugBtn.textContent=debugOn?'Disable Debug':'Enable Debug';debugBtn.className=debugOn?'primary':'warn';debugBtn.disabled=flashing;randomizeBtn.disabled=flashing;flashBtn.disabled=flashing;}"
     "function setStatus(s){statusEl.textContent=s;}"
     "function setFlashState(s){flashStateEl.textContent=s;}"
     "function refreshState(){fetch('/api/state').then(function(r){return r.json();}).then(function(s){debugOn=!!s.debug;flashing=!!s.flashing;updateBtn();setStatus('Wi-Fi STA: " WIFI_STA_SSID " @ " WIFI_STATIC_IP " | Link: '+(s.wifi?'UP':'DOWN')+' | Debug: '+(debugOn?'ON':'OFF')+' | Flash: '+(flashing?'BUSY':'IDLE')+' | STM lines: '+s.lines+' | bytes: '+s.bytes);if(flashing){setFlashState('Flashing in progress. Do not power-cycle devices.');}else if(s.last_flash_bytes>0){setFlashState('Last flash '+(s.last_flash_ok?'OK':'FAILED')+' ('+s.last_flash_bytes+' bytes).');}}).catch(function(){setStatus('Disconnected from ESP.');});}"
     "function refreshLogs(){fetch('/api/logs').then(function(r){return r.text();}).then(function(t){if(t!==lastLogs){lastLogs=t;logsEl.textContent=t;logsEl.scrollTop=logsEl.scrollHeight;}}).catch(function(){});}" 
     "debugBtn.onclick=function(){var body=debugOn?'0':'1';fetch('/api/debug',{method:'POST',body:body}).then(function(){refreshState();refreshLogs();});};"
+    "randomizeBtn.onclick=function(){if(flashing){return;}fetch('/api/randomize',{method:'POST'}).then(function(resp){return resp.text().then(function(text){return{ok:resp.ok,text:text};});}).then(function(result){var obj=null;try{obj=JSON.parse(result.text);}catch(e){}if(result.ok&&obj&&obj.ok){setFlashState('UID/signature randomized on STM.');}else if(obj&&obj.error){setFlashState('Randomize failed: '+obj.error);}else{setFlashState('Randomize failed.');}refreshLogs();}).catch(function(){setFlashState('Randomize request failed.');});};"
     "flashBtn.onclick=function(){if(flashing){return;}if(!fwFileEl.files||!fwFileEl.files.length){setFlashState('Choose a .bin file first.');return;}var file=fwFileEl.files[0];if(file.size>65536){setFlashState('Firmware too large for STM32F103C8 (max 65536 bytes).');return;}setFlashState('Uploading '+file.name+' ('+file.size+' bytes)...');fetch('/api/flash',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file}).then(function(resp){return resp.text().then(function(text){return{ok:resp.ok,text:text};});}).then(function(result){var obj=null;try{obj=JSON.parse(result.text);}catch(e){}if(result.ok&&obj&&obj.ok){setFlashState('Flash complete: '+obj.bytes+' bytes.');}else if(obj&&obj.error){setFlashState('Flash failed: '+obj.error);}else{setFlashState('Flash failed.');}refreshState();refreshLogs();}).catch(function(){setFlashState('Flash request failed.');});};"
     "refreshState();refreshLogs();setInterval(refreshState,1000);setInterval(refreshLogs,1000);"
     "</script></body></html>";
@@ -605,11 +608,6 @@ cleanup:
 
 static void stm_send_debug_toggle(bool enabled)
 {
-    if (g_flash_in_progress) {
-        push_log_line("[esp] debug toggle ignored while flashing");
-        return;
-    }
-
     if (xSemaphoreTake(g_uart_mutex, pdMS_TO_TICKS(1500)) != pdTRUE) {
         push_log_line("[esp] debug toggle failed: UART busy");
         return;
@@ -622,6 +620,32 @@ static void stm_send_debug_toggle(bool enabled)
     xSemaphoreGive(g_uart_mutex);
 
     push_logf("[esp] sent debug command to STM32: %s", enabled ? "ON" : "OFF");
+}
+
+static esp_err_t stm_send_text_command(const char *cmd, const char *log_label)
+{
+    if (cmd == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (g_flash_in_progress) {
+        push_logf("[esp] %s ignored while flashing", log_label != NULL ? log_label : "command");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(g_uart_mutex, pdMS_TO_TICKS(1500)) != pdTRUE) {
+        push_logf("[esp] %s failed: UART busy", log_label != NULL ? log_label : "command");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    uart_write_bytes(STM_UART_NUM, cmd, strlen(cmd));
+    uart_wait_tx_done(STM_UART_NUM, pdMS_TO_TICKS(300));
+    xSemaphoreGive(g_uart_mutex);
+
+    if (log_label != NULL) {
+        push_logf("[esp] sent %s to STM32", log_label);
+    }
+    return ESP_OK;
 }
 
 static void stm_schedule_debug_sync(TickType_t delay_ticks)
@@ -739,6 +763,23 @@ static esp_err_t api_debug_post_handler(httpd_req_t *req)
     return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t api_randomize_post_handler(httpd_req_t *req)
+{
+    if (g_flash_in_progress) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_send(req, "{\"ok\":false,\"error\":\"flash busy\"}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    esp_err_t err = stm_send_text_command("CMD:UIDSIG:RANDOM\n", "randomize command");
+    httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_send(req, "{\"ok\":false,\"error\":\"uart unavailable\"}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t api_flash_post_handler(httpd_req_t *req)
 {
     if (g_flash_in_progress) {
@@ -829,6 +870,12 @@ static httpd_handle_t start_webserver(void)
         .handler = api_debug_post_handler,
     };
 
+    const httpd_uri_t api_randomize_uri = {
+        .uri = "/api/randomize",
+        .method = HTTP_POST,
+        .handler = api_randomize_post_handler,
+    };
+
     const httpd_uri_t api_flash_uri = {
         .uri = "/api/flash",
         .method = HTTP_POST,
@@ -840,6 +887,7 @@ static httpd_handle_t start_webserver(void)
     httpd_register_uri_handler(server, &api_logs_uri);
     httpd_register_uri_handler(server, &api_state_uri);
     httpd_register_uri_handler(server, &api_debug_uri);
+    httpd_register_uri_handler(server, &api_randomize_uri);
     httpd_register_uri_handler(server, &api_flash_uri);
 
     return server;
