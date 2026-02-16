@@ -39,6 +39,8 @@ static void MX_I2C2_Init(void);
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include "dmo_skus.h"
 #include "rfid_scanner.h"
 #include "tag_emu_signature.h"
@@ -48,6 +50,28 @@ static void MX_I2C2_Init(void);
 #define SLIX2_SYSINFO_LEN    14
 #define SLIX2_NXPSYSINFO_LEN  7
 #define SLIX2_SIGNATURE_LEN  32
+
+// ESP32 companion UART command/debug channel (USART1: PA9 TX, PA10 RX)
+#define ESP_UART_BAUDRATE            115200u
+#define ESP_UART_RX_BUF_LEN          96u
+#define ESP_DEBUG_STATUS_PERIOD_MS   250u
+
+typedef struct {
+  bool enabled;
+  char rx_buf[ESP_UART_RX_BUF_LEN];
+  uint8_t rx_len;
+  uint32_t next_status_ms;
+  volatile uint32_t i2c_rx_frames;
+  volatile uint32_t i2c_tx_frames;
+  volatile uint32_t i2c_rx_bytes;
+  volatile uint32_t i2c_tx_bytes;
+  volatile uint32_t i2c_error_count;
+  volatile uint8_t last_clrc_reg;
+  volatile uint8_t last_clrc_cmd;
+  volatile uint8_t last_tag_cmd;
+} EspDebugState;
+
+static EspDebugState ESP_DebugState;
 
 /////////////////////////////////////////////////////////
 // DMO emulation data (default emulation after power up)
@@ -226,6 +250,130 @@ static void EMU_SLIX2_SyncSysInfoWithInventoryUID(void) {
   memcpy(EMU_SLIX2_SYSINFO + 1, EMU_SLIX2_INVENTORY + 1, 8);
 }
 
+static void ESP_UART_SendByte(const uint8_t value) {
+  while(0u == (USART1->SR & USART_SR_TXE)) {
+  }
+  USART1->DR = value;
+}
+
+static void ESP_UART_SendString(const char* text) {
+  if( NULL == text )
+    return;
+
+  while( '\0' != *text ) {
+    ESP_UART_SendByte((uint8_t)(*text));
+    text++;
+  }
+}
+
+static void ESP_UART_SendLine(const char* text) {
+  ESP_UART_SendString(text);
+  ESP_UART_SendByte('\n');
+}
+
+static void ESP_UART_Sendf(const char* fmt, ...) {
+  char line[192];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(line, sizeof(line), fmt, args);
+  va_end(args);
+  ESP_UART_SendLine(line);
+}
+
+static void ESP_UART_Init(void) {
+  GPIO_InitTypeDef gpio = {0};
+  uint32_t usartdiv = HAL_RCC_GetPCLK2Freq() / ESP_UART_BAUDRATE;
+  if( 0u == usartdiv )
+    usartdiv = 1u;
+
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_USART1_CLK_ENABLE();
+
+  gpio.Pin = GPIO_PIN_9;
+  gpio.Mode = GPIO_MODE_AF_PP;
+  gpio.Pull = GPIO_NOPULL;
+  gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOA, &gpio);
+
+  gpio.Pin = GPIO_PIN_10;
+  gpio.Mode = GPIO_MODE_INPUT;
+  gpio.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &gpio);
+
+  USART1->CR1 = 0;
+  USART1->BRR = usartdiv;
+  USART1->CR2 = 0;
+  USART1->CR3 = 0;
+  USART1->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+}
+
+static void ESP_DebugSetEnabled(const bool enabled) {
+  ESP_DebugState.enabled = enabled;
+  ESP_DebugState.next_status_ms = HAL_GetTick();
+  ESP_UART_Sendf("ACK:DEBUG:%u", enabled ? 1u : 0u);
+}
+
+static void ESP_UART_HandleCommand(const char* cmd) {
+  if( 0 == strcmp(cmd, "CMD:DEBUG:1") ) {
+    ESP_DebugSetEnabled(true);
+  }
+  else if( 0 == strcmp(cmd, "CMD:DEBUG:0") ) {
+    ESP_DebugSetEnabled(false);
+  }
+  else if( 0 == strcmp(cmd, "CMD:PING") ) {
+    ESP_UART_SendLine("ACK:PONG");
+  }
+  else {
+    ESP_UART_SendLine("ERR:UNKNOWN_CMD");
+  }
+}
+
+static void ESP_UART_PollCommands(void) {
+  while( 0u != (USART1->SR & USART_SR_RXNE) ) {
+    const char ch = (char)(USART1->DR & 0xFFu);
+
+    if( '\r' == ch )
+      continue;
+
+    if( '\n' == ch ) {
+      if( ESP_DebugState.rx_len > 0u ) {
+        ESP_DebugState.rx_buf[ESP_DebugState.rx_len] = '\0';
+        ESP_UART_HandleCommand(ESP_DebugState.rx_buf);
+        ESP_DebugState.rx_len = 0u;
+      }
+      continue;
+    }
+
+    if( ESP_DebugState.rx_len + 1u >= ESP_UART_RX_BUF_LEN ) {
+      ESP_DebugState.rx_len = 0u;
+      continue;
+    }
+
+    ESP_DebugState.rx_buf[ESP_DebugState.rx_len++] = ch;
+  }
+}
+
+static void ESP_DebugSendPeriodicStatus(void) {
+  if( !ESP_DebugState.enabled )
+    return;
+
+  if( (int32_t)(HAL_GetTick() - ESP_DebugState.next_status_ms) < 0 )
+    return;
+
+  ESP_DebugState.next_status_ms = HAL_GetTick() + ESP_DEBUG_STATUS_PERIOD_MS;
+  ESP_UART_Sendf(
+    "DBG:I2C rx_frames=%lu rx_bytes=%lu tx_frames=%lu tx_bytes=%lu err=%lu last_reg=0x%02X last_cmd=0x%02X last_tag=0x%02X",
+    (unsigned long)ESP_DebugState.i2c_rx_frames,
+    (unsigned long)ESP_DebugState.i2c_rx_bytes,
+    (unsigned long)ESP_DebugState.i2c_tx_frames,
+    (unsigned long)ESP_DebugState.i2c_tx_bytes,
+    (unsigned long)ESP_DebugState.i2c_error_count,
+    (unsigned)ESP_DebugState.last_clrc_reg,
+    (unsigned)ESP_DebugState.last_clrc_cmd,
+    (unsigned)ESP_DebugState.last_tag_cmd
+  );
+}
+
 void EMU_SLIX2_CounterReset() {
   uint16_t amount_of_labels = EMU_SLIX2_BLOCKS[0x0F]>>16;
   uint16_t counter_margin = EMU_SLIX2_BLOCKS[0x10]>>16;
@@ -233,6 +381,14 @@ void EMU_SLIX2_CounterReset() {
 }
 
 void EMU_SLIX2_Communication(const uint8_t* pindata, const uint8_t inlength, uint8_t* poutdata, uint8_t* poutlength) {
+  if( inlength < 2u ) {
+    poutdata[0] = 0x01;
+    *poutlength = 1;
+    return;
+  }
+
+  ESP_DebugState.last_tag_cmd = pindata[1];
+
   switch(pindata[1]) { //emulate command for tag
     case 0x01: { //inventory
       EMU_SLIX2_CounterReset();
@@ -304,6 +460,10 @@ void EMU_CLRC688_Communication(const uint8_t* pindata, const uint8_t inlength, u
 
   *poutlength = 0;
   if( inlength>0 ) {
+    ESP_DebugState.last_clrc_reg = pindata[0];
+    if( (0x00 == pindata[0]) && (inlength > 1u) )
+      ESP_DebugState.last_clrc_cmd = pindata[1];
+
     switch( pindata[0] ) {
       case 0x00: { //command for reader ic
         switch( pindata[1] ) { 
@@ -414,11 +574,16 @@ static uint8_t I2CSlaveSendBuf[I2C_SND_BUF_SIZE];
 static uint8_t I2CSlaveSendBufLen;
 
 void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t transferDirection, uint16_t addrMatchCode) {
+  (void)addrMatchCode;
+
   if (transferDirection == I2C_DIRECTION_RECEIVE) { //DIRECTION_RECEIVE refers to master => for us (slave) means sending 
-      EMU_CLRC688_Communication(I2CSlaveRecvBuf, I2CSlaveRecvBufLen, I2CSlaveSendBuf, &I2CSlaveSendBufLen);
+    EMU_CLRC688_Communication(I2CSlaveRecvBuf, I2CSlaveRecvBufLen, I2CSlaveSendBuf, &I2CSlaveSendBufLen);
+    ESP_DebugState.i2c_tx_frames++;
+    ESP_DebugState.i2c_tx_bytes += I2CSlaveSendBufLen;
     HAL_I2C_Slave_Seq_Transmit_IT(hi2c, I2CSlaveSendBuf, I2CSlaveSendBufLen, I2C_LAST_FRAME);
   } else {
     I2CSlaveRecvBufLen = 0;
+    ESP_DebugState.i2c_rx_frames++;
     HAL_I2C_Slave_Seq_Receive_IT(hi2c, I2CSlaveRecvBuf, 1, I2C_NEXT_FRAME);
   }
   HAL_GPIO_WritePin(OUT_LED_GPIO_Port, OUT_LED_Pin, GPIO_PIN_RESET);
@@ -426,6 +591,7 @@ void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t transferDirection, ui
 
 void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c) {
   I2CSlaveRecvBufLen++;
+  ESP_DebugState.i2c_rx_bytes++;
   if( I2CSlaveRecvBufLen < I2C_RCV_BUF_SIZE )
     HAL_I2C_Slave_Seq_Receive_IT(hi2c, I2CSlaveRecvBuf + I2CSlaveRecvBufLen, 1, I2C_NEXT_FRAME);
 }
@@ -440,6 +606,7 @@ void HAL_I2C_ListenCpltCallback(I2C_HandleTypeDef *hi2c) {
 }
 
 void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
+  ESP_DebugState.i2c_error_count++;
   HAL_I2C_EnableListen_IT(hi2c);
 }
 //
@@ -478,13 +645,20 @@ int main(void)
   //////////////////////////////////////////////
   //
   InitEmulationWithDefaultData();
+  ESP_UART_Init();
+  ESP_UART_SendLine("FREE-DMO STM32 bridge online");
+  ESP_UART_SendLine("INFO:commands CMD:DEBUG:1 CMD:DEBUG:0 CMD:PING");
 
   //start listening as I2C slave
   HAL_I2C_EnableListen_IT(&hi2c1);
 
   //main loop
+  uint32_t rfid_next_tick = HAL_GetTick();
   for(;;) {
-    if( rfid_scanner_attached )
+    ESP_UART_PollCommands();
+    ESP_DebugSendPeriodicStatus();
+
+    if( rfid_scanner_attached && ((int32_t)(HAL_GetTick() - rfid_next_tick) >= 0) ) {
       RFID_Scanner_UpdateFromRealTag(
         &hi2c2,
         EMU_SLIX2_INVENTORY,  SLIX2_INVENTORY_LEN,
@@ -494,7 +668,10 @@ int main(void)
         EMU_SLIX2_BLOCKS,     SLIX2_BLOCKS,
         &EMU_SLIX2_TAG_PRESENT
       );
-    HAL_Delay(100);
+      rfid_next_tick = HAL_GetTick() + 100u;
+    }
+
+    HAL_Delay(2);
   }
   //
   //////////////////////////////////////////////
