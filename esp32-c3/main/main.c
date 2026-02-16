@@ -18,20 +18,22 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "free_dmo_config.h"
 
-#define AP_SSID "free-dmo-debug"
 #define AP_CHANNEL 6
 #define AP_MAX_CONN 4
 
-#define STM_UART_NUM UART_NUM_1
-#define STM_UART_TX_GPIO GPIO_NUM_4
-#define STM_UART_RX_GPIO GPIO_NUM_5
-#define STM_UART_BAUDRATE 115200
-#define STM_UART_BUF_SIZE 256
+#define AP_SSID FREE_DMO_CFG_ESP_AP_SSID
+
+#define STM_UART_NUM ((uart_port_t)FREE_DMO_CFG_ESP_STM_UART_NUM)
+#define STM_UART_TX_GPIO ((gpio_num_t)FREE_DMO_CFG_ESP_STM_UART_TX_GPIO)
+#define STM_UART_RX_GPIO ((gpio_num_t)FREE_DMO_CFG_ESP_STM_UART_RX_GPIO)
+#define STM_UART_BAUDRATE FREE_DMO_CFG_ESP_STM_UART_BAUDRATE
+#define STM_UART_BUF_SIZE FREE_DMO_CFG_ESP_STM_UART_BUF_SIZE
 #define STM_LINE_BUF_SIZE 256
 
-#define STM_BOOT0_GPIO GPIO_NUM_6
-#define STM_RESET_GPIO GPIO_NUM_7
+#define STM_BOOT0_GPIO ((gpio_num_t)FREE_DMO_CFG_ESP_STM_BOOT0_GPIO)
+#define STM_RESET_GPIO ((gpio_num_t)FREE_DMO_CFG_ESP_STM_RESET_GPIO)
 
 #define STM_FLASH_BASE_ADDR 0x08000000UL
 #define STM_FLASH_MAX_SIZE (64U * 1024U)
@@ -49,6 +51,9 @@
 #define LOG_RING_SIZE 16384
 
 static const char *TAG = "freedmo-bridge";
+
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
 
 static SemaphoreHandle_t g_log_mutex;
 static SemaphoreHandle_t g_uart_mutex;
@@ -103,7 +108,7 @@ static const char INDEX_HTML[] =
     "<label>Firmware (.bin, max 64 KiB)</label><input id='fwFile' type='file' accept='.bin,application/octet-stream'><br><br>"
     "<button id='flashBtn' class='flash'>Flash STM32</button>"
     "<div id='flashState'></div>"
-    "<p><small>Wire STM32 `BOOT0` to ESP32 GPIO6 and `NRST` to ESP32 GPIO7. UART stays on TX=GPIO4 RX=GPIO5.</small></p>"
+    "<p><small>Wire STM32 `BOOT0` to ESP32 GPIO" STR(FREE_DMO_CFG_ESP_STM_BOOT0_GPIO) " and `NRST` to ESP32 GPIO" STR(FREE_DMO_CFG_ESP_STM_RESET_GPIO) ". UART stays on TX=GPIO" STR(FREE_DMO_CFG_ESP_STM_UART_TX_GPIO) " RX=GPIO" STR(FREE_DMO_CFG_ESP_STM_UART_RX_GPIO) ".</small></p>"
     "</div>"
     "<div class='card'><h3>Live Output</h3><div id='logs'></div></div>"
     "</div></div>"
@@ -120,7 +125,7 @@ static const char INDEX_HTML[] =
     "function updateBtn(){debugBtn.textContent=debugOn?'Disable Debug':'Enable Debug';debugBtn.className=debugOn?'primary':'warn';debugBtn.disabled=flashing;flashBtn.disabled=flashing;}"
     "function setStatus(s){statusEl.textContent=s;}"
     "function setFlashState(s){flashStateEl.textContent=s;}"
-    "function refreshState(){fetch('/api/state').then(function(r){return r.json();}).then(function(s){debugOn=!!s.debug;flashing=!!s.flashing;updateBtn();setStatus('Wi-Fi AP: free-dmo-debug @ 192.168.4.1 | Debug: '+(debugOn?'ON':'OFF')+' | Flash: '+(flashing?'BUSY':'IDLE')+' | STM lines: '+s.lines+' | bytes: '+s.bytes);if(flashing){setFlashState('Flashing in progress. Do not power-cycle devices.');}else if(s.last_flash_bytes>0){setFlashState('Last flash '+(s.last_flash_ok?'OK':'FAILED')+' ('+s.last_flash_bytes+' bytes).');}}).catch(function(){setStatus('Disconnected from ESP.');});}"
+    "function refreshState(){fetch('/api/state').then(function(r){return r.json();}).then(function(s){debugOn=!!s.debug;flashing=!!s.flashing;updateBtn();setStatus('Wi-Fi AP: " AP_SSID " @ 192.168.4.1 | Debug: '+(debugOn?'ON':'OFF')+' | Flash: '+(flashing?'BUSY':'IDLE')+' | STM lines: '+s.lines+' | bytes: '+s.bytes);if(flashing){setFlashState('Flashing in progress. Do not power-cycle devices.');}else if(s.last_flash_bytes>0){setFlashState('Last flash '+(s.last_flash_ok?'OK':'FAILED')+' ('+s.last_flash_bytes+' bytes).');}}).catch(function(){setStatus('Disconnected from ESP.');});}"
     "function refreshLogs(){fetch('/api/logs').then(function(r){return r.text();}).then(function(t){if(t!==lastLogs){lastLogs=t;logsEl.textContent=t;logsEl.scrollTop=logsEl.scrollHeight;}}).catch(function(){});}" 
     "debugBtn.onclick=function(){var body=debugOn?'0':'1';fetch('/api/debug',{method:'POST',body:body}).then(function(){refreshState();refreshLogs();});};"
     "flashBtn.onclick=function(){if(flashing){return;}if(!fwFileEl.files||!fwFileEl.files.length){setFlashState('Choose a .bin file first.');return;}var file=fwFileEl.files[0];if(file.size>65536){setFlashState('Firmware too large for STM32F103C8 (max 65536 bytes).');return;}setFlashState('Uploading '+file.name+' ('+file.size+' bytes)...');fetch('/api/flash',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file}).then(function(resp){return resp.text().then(function(text){return{ok:resp.ok,text:text};});}).then(function(result){var obj=null;try{obj=JSON.parse(result.text);}catch(e){}if(result.ok&&obj&&obj.ok){setFlashState('Flash complete: '+obj.bytes+' bytes.');}else if(obj&&obj.error){setFlashState('Flash failed: '+obj.error);}else{setFlashState('Flash failed.');}refreshState();refreshLogs();}).catch(function(){setFlashState('Flash request failed.');});};"
@@ -891,7 +896,9 @@ void app_main(void)
     ESP_LOGI(TAG, "Web console ready: connect to AP '%s' then open http://192.168.4.1", AP_SSID);
     push_log_line("[esp] boot complete");
     push_log_line("[esp] web console available at http://192.168.4.1");
-    push_log_line("[esp] stm flash pins: BOOT0=GPIO6 NRST=GPIO7");
+    push_logf("[esp] stm flash pins: BOOT0=GPIO%u NRST=GPIO%u",
+              (unsigned)FREE_DMO_CFG_ESP_STM_BOOT0_GPIO,
+              (unsigned)FREE_DMO_CFG_ESP_STM_RESET_GPIO);
 
     const char *hello = "FREE-DMO ESP32-C3 bridge online\n";
     uart_write_bytes(STM_UART_NUM, hello, strlen(hello));

@@ -44,6 +44,7 @@ static void MX_I2C2_Init(void);
 #include "dmo_skus.h"
 #include "rfid_scanner.h"
 #include "tag_emu_signature.h"
+#include "free_dmo_config.h"
 
 #define SLIX2_BLOCKS         80
 #define SLIX2_INVENTORY_LEN   9
@@ -52,7 +53,7 @@ static void MX_I2C2_Init(void);
 #define SLIX2_SIGNATURE_LEN  32
 
 // ESP32 companion UART command/debug channel (USART1: PA9 TX, PA10 RX)
-#define ESP_UART_BAUDRATE            115200u
+#define ESP_UART_BAUDRATE            FREE_DMO_CFG_STM_ESP_UART_BAUDRATE
 #define ESP_UART_RX_BUF_LEN          96u
 #define ESP_DEBUG_STATUS_PERIOD_MS   250u
 
@@ -78,7 +79,7 @@ static EspDebugState ESP_DebugState;
 //
 
 // default emulated SKU selected at runtime from dmo_skus.c
-#define DEFAULT_DMO_SKU_NAME "30333"
+#define DEFAULT_DMO_SKU_NAME FREE_DMO_CFG_STM_DEFAULT_SKU_NAME
 static const bool rfid_scanner_attached = false;
 
 static const uint8_t DMO_TAG_SLIX2_SYSINFO_TEMPLATE[SLIX2_SYSINFO_LEN] = {
@@ -238,11 +239,15 @@ static bool EMU_TagPairStoreNextIndex(const uint8_t used_index) {
 }
 
 static uint8_t EMU_TagPairChooseBootIndex(void) {
+#if (FREE_DMO_CFG_STM_UID_SIG_MODE_RANDOM == 0)
+  return (uint8_t)(FREE_DMO_CFG_STM_UID_SIG_FIXED_INDEX % DMO_TAG_EMU_PAIRS_COUNT);
+#else
   uint8_t index = 0;
   if( EMU_TagPairLoadNextIndex(&index) )
     return index;
 
   return (uint8_t)(EMU_TagPairPrngNext() % DMO_TAG_EMU_PAIRS_COUNT);
+#endif
 }
 
 static void EMU_SLIX2_SyncSysInfoWithInventoryUID(void) {
@@ -526,7 +531,9 @@ void EMU_CLRC688_Communication(const uint8_t* pindata, const uint8_t inlength, u
 void InitEmulationWithDefaultData(void) {
   uint8_t pair_index = EMU_TagPairChooseBootIndex();
   const DmoTagEmuPair* pair = &DMO_TAG_EMU_PAIRS[pair_index];
+#if (FREE_DMO_CFG_STM_UID_SIG_MODE_RANDOM != 0)
   (void)EMU_TagPairStoreNextIndex(pair_index);
+#endif
 
   // use the selected UID+signature pair and mirror UID bytes into sysinfo
   EMU_SLIX2_INVENTORY[0] = 0x01;

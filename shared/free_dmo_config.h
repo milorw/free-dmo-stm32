@@ -1,0 +1,51 @@
+#ifndef FREE_DMO_CONFIG_H
+#define FREE_DMO_CONFIG_H
+
+/*
+ * Central project configuration for both firmware targets.
+ *
+ * Edit this file before building to change wiring defaults and boot-time
+ * emulation selections.
+ */
+
+/* ----------------------------- ESP32-C3 config ---------------------------- */
+
+/* SoftAP SSID used by the ESP32 web UI. */
+#define FREE_DMO_CFG_ESP_AP_SSID "free-dmo-debug"
+
+/* UART link from ESP32-C3 to STM32 (ESP side numbering). */
+#define FREE_DMO_CFG_ESP_STM_UART_NUM      1
+#define FREE_DMO_CFG_ESP_STM_UART_TX_GPIO  4
+#define FREE_DMO_CFG_ESP_STM_UART_RX_GPIO  5
+#define FREE_DMO_CFG_ESP_STM_UART_BAUDRATE 115200u
+#define FREE_DMO_CFG_ESP_STM_UART_BUF_SIZE 256u
+
+/* GPIOs that drive STM32 BOOT0 and NRST for in-circuit flashing. */
+#define FREE_DMO_CFG_ESP_STM_BOOT0_GPIO 6
+#define FREE_DMO_CFG_ESP_STM_RESET_GPIO 7
+
+/* ------------------------------ STM32 config ------------------------------ */
+
+/*
+ * Boot-time default label SKU.
+ * Must match one of the entries in stm32/Src/dmo_skus.c (e.g. "30333").
+ */
+#define FREE_DMO_CFG_STM_DEFAULT_SKU_NAME "30333"
+
+/*
+ * UID/signature pair selection mode at boot:
+ * 1 = rotate/random using stored next-index logic
+ * 0 = always use FREE_DMO_CFG_STM_UID_SIG_FIXED_INDEX
+ */
+#define FREE_DMO_CFG_STM_UID_SIG_MODE_RANDOM 1
+
+/*
+ * Fixed UID/signature pair index when random mode is disabled.
+ * Valid range: 0 .. (DMO_TAG_EMU_PAIRS_COUNT - 1)
+ */
+#define FREE_DMO_CFG_STM_UID_SIG_FIXED_INDEX 0u
+
+/* STM32 USART1 link speed for ESP command/debug channel. */
+#define FREE_DMO_CFG_STM_ESP_UART_BAUDRATE 115200u
+
+#endif /* FREE_DMO_CONFIG_H */
