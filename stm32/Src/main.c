@@ -56,6 +56,23 @@ static void MX_I2C2_Init(void);
 #define ESP_UART_BAUDRATE            FREE_DMO_CFG_STM_ESP_UART_BAUDRATE
 #define ESP_UART_RX_BUF_LEN          96u
 #define ESP_DEBUG_STATUS_PERIOD_MS   250u
+#define ESP_DEBUG_EVENT_QUEUE_LEN    24u
+#define ESP_DEBUG_FRAME_SNAPSHOT_LEN 48u
+#define ESP_UART_IRQ_BUF_LEN         256u
+
+typedef enum {
+  ESP_DEBUG_EVENT_I2C_RX = 0,
+  ESP_DEBUG_EVENT_I2C_TX = 1,
+  ESP_DEBUG_EVENT_I2C_ERR = 2
+} EspDebugEventType;
+
+typedef struct {
+  uint8_t type;
+  uint8_t data_len;
+  uint16_t full_len;
+  uint32_t arg;
+  uint8_t data[ESP_DEBUG_FRAME_SNAPSHOT_LEN];
+} EspDebugEvent;
 
 typedef struct {
   bool enabled;
@@ -70,6 +87,14 @@ typedef struct {
   volatile uint8_t last_clrc_reg;
   volatile uint8_t last_clrc_cmd;
   volatile uint8_t last_tag_cmd;
+  volatile uint8_t event_head;
+  volatile uint8_t event_tail;
+  volatile uint32_t dropped_events;
+  volatile uint32_t dropped_uart_rx_bytes;
+  volatile uint16_t uart_rx_head;
+  volatile uint16_t uart_rx_tail;
+  volatile uint8_t uart_rx_ring[ESP_UART_IRQ_BUF_LEN];
+  EspDebugEvent events[ESP_DEBUG_EVENT_QUEUE_LEN];
 } EspDebugState;
 
 static EspDebugState ESP_DebugState;
@@ -285,6 +310,131 @@ static void ESP_UART_Sendf(const char* fmt, ...) {
   ESP_UART_SendLine(line);
 }
 
+void ESP_UART_IRQHandler(void) {
+  const uint32_t sr = USART1->SR;
+  if( 0u != (sr & (USART_SR_RXNE | USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) ) {
+    const uint8_t ch = (uint8_t)(USART1->DR & 0xFFu);
+    if( 0u != (sr & USART_SR_RXNE) ) {
+      uint16_t next_head = (uint16_t)(ESP_DebugState.uart_rx_head + 1u);
+      if( next_head >= ESP_UART_IRQ_BUF_LEN )
+        next_head = 0u;
+
+      if( next_head != ESP_DebugState.uart_rx_tail ) {
+        ESP_DebugState.uart_rx_ring[ESP_DebugState.uart_rx_head] = ch;
+        ESP_DebugState.uart_rx_head = next_head;
+      }
+      else {
+        ESP_DebugState.dropped_uart_rx_bytes++;
+      }
+    }
+  }
+}
+
+static uint32_t ESP_DebugIrqLock(void) {
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  return primask;
+}
+
+static void ESP_DebugIrqUnlock(const uint32_t primask) {
+  if( 0u == (primask & 1u) ) {
+    __enable_irq();
+  }
+}
+
+static bool ESP_DebugQueuePush(const EspDebugEvent* event) {
+  if( NULL == event )
+    return false;
+
+  uint32_t irq_state = ESP_DebugIrqLock();
+  uint8_t next_head = (uint8_t)((ESP_DebugState.event_head + 1u) % ESP_DEBUG_EVENT_QUEUE_LEN);
+  if( next_head == ESP_DebugState.event_tail ) {
+    ESP_DebugState.dropped_events++;
+    ESP_DebugIrqUnlock(irq_state);
+    return false;
+  }
+
+  ESP_DebugState.events[ESP_DebugState.event_head] = *event;
+  ESP_DebugState.event_head = next_head;
+  ESP_DebugIrqUnlock(irq_state);
+  return true;
+}
+
+static bool ESP_DebugQueuePop(EspDebugEvent* event) {
+  if( NULL == event )
+    return false;
+
+  uint32_t irq_state = ESP_DebugIrqLock();
+  if( ESP_DebugState.event_tail == ESP_DebugState.event_head ) {
+    ESP_DebugIrqUnlock(irq_state);
+    return false;
+  }
+
+  *event = ESP_DebugState.events[ESP_DebugState.event_tail];
+  ESP_DebugState.event_tail = (uint8_t)((ESP_DebugState.event_tail + 1u) % ESP_DEBUG_EVENT_QUEUE_LEN);
+  ESP_DebugIrqUnlock(irq_state);
+  return true;
+}
+
+static void ESP_DebugQueueI2CFrame(const EspDebugEventType type, const uint8_t* data, const uint16_t len) {
+  if( !ESP_DebugState.enabled )
+    return;
+
+  EspDebugEvent event = {0};
+  event.type = (uint8_t)type;
+  event.full_len = len;
+  event.data_len = (uint8_t)((len > ESP_DEBUG_FRAME_SNAPSHOT_LEN) ? ESP_DEBUG_FRAME_SNAPSHOT_LEN : len);
+  if( (event.data_len > 0u) && (NULL != data) ) {
+    memcpy(event.data, data, event.data_len);
+  }
+  (void)ESP_DebugQueuePush(&event);
+}
+
+static void ESP_DebugQueueI2CError(const uint32_t error_code) {
+  if( !ESP_DebugState.enabled )
+    return;
+
+  EspDebugEvent event = {0};
+  event.type = (uint8_t)ESP_DEBUG_EVENT_I2C_ERR;
+  event.arg = error_code;
+  (void)ESP_DebugQueuePush(&event);
+}
+
+static void ESP_DebugDrainEvents(void) {
+  if( !ESP_DebugState.enabled )
+    return;
+
+  EspDebugEvent event;
+  while( ESP_DebugQueuePop(&event) ) {
+    if( ESP_DEBUG_EVENT_I2C_ERR == event.type ) {
+      ESP_UART_Sendf("DBG:I2C ERR code=0x%08lX", (unsigned long)event.arg);
+      continue;
+    }
+
+    const char* dir = (ESP_DEBUG_EVENT_I2C_RX == event.type) ? "RX" : "TX";
+    char line[320];
+    int pos = snprintf(line, sizeof(line), "DBG:I2C %s len=%u data=", dir, (unsigned)event.full_len);
+    if( pos < 0 ) {
+      continue;
+    }
+
+    for(uint16_t i=0; i<event.data_len; i++) {
+      int written = snprintf(line + pos, sizeof(line) - (size_t)pos, "%02X%s",
+                             (unsigned)event.data[i], (i + 1u < event.data_len) ? " " : "");
+      if( written <= 0 )
+        break;
+      pos += written;
+      if( pos >= (int)sizeof(line) - 8 )
+        break;
+    }
+
+    if( event.full_len > event.data_len ) {
+      (void)snprintf(line + pos, sizeof(line) - (size_t)pos, " ...");
+    }
+    ESP_UART_SendLine(line);
+  }
+}
+
 static void ESP_UART_Init(void) {
   GPIO_InitTypeDef gpio = {0};
   uint32_t usartdiv = HAL_RCC_GetPCLK2Freq() / ESP_UART_BAUDRATE;
@@ -309,12 +459,22 @@ static void ESP_UART_Init(void) {
   USART1->BRR = usartdiv;
   USART1->CR2 = 0;
   USART1->CR3 = 0;
-  USART1->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+  USART1->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;
+
+  HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
 
 static void ESP_DebugSetEnabled(const bool enabled) {
   ESP_DebugState.enabled = enabled;
   ESP_DebugState.next_status_ms = HAL_GetTick();
+  ESP_DebugState.event_head = 0u;
+  ESP_DebugState.event_tail = 0u;
+  ESP_DebugState.dropped_events = 0u;
+  ESP_DebugState.dropped_uart_rx_bytes = 0u;
+  ESP_DebugState.uart_rx_head = 0u;
+  ESP_DebugState.uart_rx_tail = 0u;
+  ESP_DebugState.rx_len = 0u;
   ESP_UART_Sendf("ACK:DEBUG:%u", enabled ? 1u : 0u);
 }
 
@@ -334,8 +494,12 @@ static void ESP_UART_HandleCommand(const char* cmd) {
 }
 
 static void ESP_UART_PollCommands(void) {
-  while( 0u != (USART1->SR & USART_SR_RXNE) ) {
-    const char ch = (char)(USART1->DR & 0xFFu);
+  while( ESP_DebugState.uart_rx_tail != ESP_DebugState.uart_rx_head ) {
+    const char ch = (char)ESP_DebugState.uart_rx_ring[ESP_DebugState.uart_rx_tail];
+    uint16_t next_tail = (uint16_t)(ESP_DebugState.uart_rx_tail + 1u);
+    if( next_tail >= ESP_UART_IRQ_BUF_LEN )
+      next_tail = 0u;
+    ESP_DebugState.uart_rx_tail = next_tail;
 
     if( '\r' == ch )
       continue;
@@ -367,12 +531,14 @@ static void ESP_DebugSendPeriodicStatus(void) {
 
   ESP_DebugState.next_status_ms = HAL_GetTick() + ESP_DEBUG_STATUS_PERIOD_MS;
   ESP_UART_Sendf(
-    "DBG:I2C rx_frames=%lu rx_bytes=%lu tx_frames=%lu tx_bytes=%lu err=%lu last_reg=0x%02X last_cmd=0x%02X last_tag=0x%02X",
+    "DBG:I2C rx_frames=%lu rx_bytes=%lu tx_frames=%lu tx_bytes=%lu err=%lu dropped=%lu cmd_drop=%lu last_reg=0x%02X last_cmd=0x%02X last_tag=0x%02X",
     (unsigned long)ESP_DebugState.i2c_rx_frames,
     (unsigned long)ESP_DebugState.i2c_rx_bytes,
     (unsigned long)ESP_DebugState.i2c_tx_frames,
     (unsigned long)ESP_DebugState.i2c_tx_bytes,
     (unsigned long)ESP_DebugState.i2c_error_count,
+    (unsigned long)ESP_DebugState.dropped_events,
+    (unsigned long)ESP_DebugState.dropped_uart_rx_bytes,
     (unsigned)ESP_DebugState.last_clrc_reg,
     (unsigned)ESP_DebugState.last_clrc_cmd,
     (unsigned)ESP_DebugState.last_tag_cmd
@@ -587,6 +753,7 @@ void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t transferDirection, ui
     EMU_CLRC688_Communication(I2CSlaveRecvBuf, I2CSlaveRecvBufLen, I2CSlaveSendBuf, &I2CSlaveSendBufLen);
     ESP_DebugState.i2c_tx_frames++;
     ESP_DebugState.i2c_tx_bytes += I2CSlaveSendBufLen;
+    ESP_DebugQueueI2CFrame(ESP_DEBUG_EVENT_I2C_TX, I2CSlaveSendBuf, I2CSlaveSendBufLen);
     HAL_I2C_Slave_Seq_Transmit_IT(hi2c, I2CSlaveSendBuf, I2CSlaveSendBufLen, I2C_LAST_FRAME);
   } else {
     I2CSlaveRecvBufLen = 0;
@@ -607,6 +774,9 @@ void HAL_I2C_SlaveTxCpltCallback(I2C_HandleTypeDef *hi2c) {
 }
 
 void HAL_I2C_ListenCpltCallback(I2C_HandleTypeDef *hi2c) {
+  if( I2CSlaveRecvBufLen > 0u ) {
+    ESP_DebugQueueI2CFrame(ESP_DEBUG_EVENT_I2C_RX, I2CSlaveRecvBuf, I2CSlaveRecvBufLen);
+  }
   EMU_CLRC688_Communication(I2CSlaveRecvBuf, I2CSlaveRecvBufLen, I2CSlaveSendBuf, &I2CSlaveSendBufLen);
   HAL_I2C_EnableListen_IT(hi2c);
   HAL_GPIO_WritePin(OUT_LED_GPIO_Port, OUT_LED_Pin, GPIO_PIN_SET);
@@ -614,6 +784,7 @@ void HAL_I2C_ListenCpltCallback(I2C_HandleTypeDef *hi2c) {
 
 void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
   ESP_DebugState.i2c_error_count++;
+  ESP_DebugQueueI2CError(hi2c->ErrorCode);
   HAL_I2C_EnableListen_IT(hi2c);
 }
 //
@@ -653,6 +824,7 @@ int main(void)
   //
   InitEmulationWithDefaultData();
   ESP_UART_Init();
+  ESP_DebugSetEnabled(FREE_DMO_CFG_STM_DEBUG_DEFAULT_ENABLED ? true : false);
   ESP_UART_SendLine("FREE-DMO STM32 bridge online");
   ESP_UART_SendLine("INFO:commands CMD:DEBUG:1 CMD:DEBUG:0 CMD:PING");
 
@@ -664,6 +836,7 @@ int main(void)
   for(;;) {
     ESP_UART_PollCommands();
     ESP_DebugSendPeriodicStatus();
+    ESP_DebugDrainEvents();
 
     if( rfid_scanner_attached && ((int32_t)(HAL_GetTick() - rfid_next_tick) >= 0) ) {
       RFID_Scanner_UpdateFromRealTag(

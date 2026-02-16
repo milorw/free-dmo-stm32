@@ -14,8 +14,8 @@
  * Existing Wi-Fi network credentials used by ESP32 station mode.
  * The ESP joins this network and serves the web UI on the static IP below.
  */
-#define FREE_DMO_CFG_ESP_WIFI_STA_SSID     "your-wifi-ssid"
-#define FREE_DMO_CFG_ESP_WIFI_STA_PASSWORD "your-wifi-password"
+#define FREE_DMO_CFG_ESP_WIFI_STA_SSID     "Loading"
+#define FREE_DMO_CFG_ESP_WIFI_STA_PASSWORD "rainer5goodwill!leeds2olympics"
 
 /* Static IPv4 configuration used by ESP32 station mode. */
 #define FREE_DMO_CFG_ESP_WIFI_STATIC_IP      "192.168.68.112"
@@ -56,5 +56,12 @@
 
 /* STM32 USART1 link speed for ESP command/debug channel. */
 #define FREE_DMO_CFG_STM_ESP_UART_BAUDRATE 115200u
+
+/*
+ * Default STM32 debug forwarding state at boot:
+ * 1 = emit debug logs immediately (no CMD:DEBUG needed)
+ * 0 = wait for CMD:DEBUG:1 from ESP
+ */
+#define FREE_DMO_CFG_STM_DEBUG_DEFAULT_ENABLED 0
 
 #endif /* FREE_DMO_CONFIG_H */

@@ -42,6 +42,7 @@
 #define STM_FLASH_MAX_SIZE (64U * 1024U)
 #define STM_FLASH_CHUNK_SIZE 256U
 #define STM32F103C8_CHIP_ID 0x0410U
+#define STM_BL_ENTER_SYNC_RETRIES 3
 
 #define STM_BL_ACK 0x79
 #define STM_BL_NACK 0x1F
@@ -52,6 +53,7 @@
 #define STM_BL_CMD_GO 0x21
 
 #define LOG_RING_SIZE 16384
+#define DEBUG_SYNC_MAX_ATTEMPTS 4
 
 static const char *TAG = "freedmo-bridge";
 
@@ -66,6 +68,10 @@ static size_t g_log_head = 0;
 static bool g_log_wrapped = false;
 
 static bool g_debug_enabled = false;
+static bool g_debug_sync_pending = false;
+static TickType_t g_debug_retry_tick = 0;
+static uint8_t g_debug_sync_attempts = 0;
+static TickType_t g_stm_boot_seen_tick = 0;
 static volatile bool g_flash_in_progress = false;
 static bool g_last_flash_ok = false;
 static uint32_t g_last_flash_bytes = 0;
@@ -73,6 +79,8 @@ static bool g_wifi_connected = false;
 
 static uint32_t g_stm_line_count = 0;
 static uint32_t g_stm_byte_count = 0;
+
+static void stm_send_debug_toggle(bool enabled);
 
 static const char INDEX_HTML[] =
     "<!doctype html><html><head><meta charset='utf-8'>"
@@ -256,7 +264,7 @@ static void stm_reset_pulse(void)
 static void stm_enter_bootloader_mode(void)
 {
     gpio_set_level(STM_BOOT0_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(25));
     stm_reset_pulse();
 }
 
@@ -492,10 +500,19 @@ static esp_err_t stm_flash_from_request(httpd_req_t *req, size_t image_size, siz
         goto cleanup;
     }
 
-    stm_enter_bootloader_mode();
-    uart_flush_input(STM_UART_NUM);
+    err = ESP_FAIL;
+    for (int attempt = 1; attempt <= STM_BL_ENTER_SYNC_RETRIES; ++attempt) {
+        stm_enter_bootloader_mode();
+        uart_flush_input(STM_UART_NUM);
+        vTaskDelay(pdMS_TO_TICKS(20));
 
-    err = stm_bl_sync();
+        err = stm_bl_sync();
+        if (err == ESP_OK) {
+            break;
+        }
+
+        push_logf("[flash] bootloader sync retry %d/%d", attempt, STM_BL_ENTER_SYNC_RETRIES);
+    }
     if (err != ESP_OK) {
         push_log_line("[flash] bootloader sync failed");
         goto cleanup;
@@ -593,7 +610,7 @@ static void stm_send_debug_toggle(bool enabled)
         return;
     }
 
-    if (xSemaphoreTake(g_uart_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+    if (xSemaphoreTake(g_uart_mutex, pdMS_TO_TICKS(1500)) != pdTRUE) {
         push_log_line("[esp] debug toggle failed: UART busy");
         return;
     }
@@ -605,6 +622,35 @@ static void stm_send_debug_toggle(bool enabled)
     xSemaphoreGive(g_uart_mutex);
 
     push_logf("[esp] sent debug command to STM32: %s", enabled ? "ON" : "OFF");
+}
+
+static void stm_schedule_debug_sync(TickType_t delay_ticks)
+{
+    g_debug_sync_pending = true;
+    g_debug_retry_tick = xTaskGetTickCount() + delay_ticks;
+    g_debug_sync_attempts = 0;
+}
+
+static void stm_debug_sync_poll(void)
+{
+    if (!g_debug_sync_pending || !g_debug_enabled || g_flash_in_progress) {
+        return;
+    }
+
+    const TickType_t now = xTaskGetTickCount();
+    if ((int32_t)(now - g_debug_retry_tick) < 0) {
+        return;
+    }
+
+    if (g_debug_sync_attempts >= DEBUG_SYNC_MAX_ATTEMPTS) {
+        g_debug_sync_pending = false;
+        push_log_line("[esp] debug sync failed: no ACK from STM (check ESP->STM UART RX path)");
+        return;
+    }
+
+    stm_send_debug_toggle(true);
+    g_debug_sync_attempts++;
+    g_debug_retry_tick = now + pdMS_TO_TICKS(1200);
 }
 
 static esp_err_t index_get_handler(httpd_req_t *req)
@@ -680,7 +726,13 @@ static esp_err_t api_debug_post_handler(httpd_req_t *req)
 
     const bool enable = (body[0] == '1' || body[0] == 'o' || body[0] == 'O' || body[0] == 't' || body[0] == 'T');
     g_debug_enabled = enable;
-    stm_send_debug_toggle(enable);
+    if (enable) {
+        stm_schedule_debug_sync(0);
+    } else {
+        g_debug_sync_pending = false;
+        g_debug_sync_attempts = 0;
+        stm_send_debug_toggle(false);
+    }
 
     const char *resp = enable ? "{\"ok\":true,\"debug\":1}" : "{\"ok\":true,\"debug\":0}";
     httpd_resp_set_type(req, "application/json");
@@ -708,6 +760,7 @@ static esp_err_t api_flash_post_handler(httpd_req_t *req)
     g_last_flash_ok = false;
     g_last_flash_bytes = 0;
     g_debug_enabled = false;
+    g_debug_sync_pending = false;
 
     push_logf("[flash] start upload (%d bytes)", req->content_len);
 
@@ -865,6 +918,35 @@ static void handle_stm_line(char *line)
     g_stm_line_count++;
     g_stm_byte_count += strlen(line);
     push_log_line(line);
+
+    if (strncmp(line, "ACK:DEBUG:1", 11) == 0 && g_debug_enabled) {
+        g_debug_sync_pending = false;
+        g_debug_sync_attempts = 0;
+        return;
+    }
+
+    if (strncmp(line, "ACK:DEBUG:0", 11) == 0 && !g_debug_enabled) {
+        g_debug_sync_pending = false;
+        g_debug_sync_attempts = 0;
+        return;
+    }
+
+    if (strncmp(line, "DBG:", 4) == 0 && g_debug_enabled) {
+        g_debug_sync_pending = false;
+        g_debug_sync_attempts = 0;
+        return;
+    }
+
+    if ((strstr(line, "FREE-DMO STM32 bridge online") != NULL ||
+         strstr(line, "INFO:commands") != NULL) &&
+        g_debug_enabled) {
+        const TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(now - g_stm_boot_seen_tick) > pdMS_TO_TICKS(500)) {
+            g_stm_boot_seen_tick = now;
+            push_log_line("[esp] STM boot detected; re-syncing debug enable");
+            stm_schedule_debug_sync(pdMS_TO_TICKS(80));
+        }
+    }
 }
 
 static void stm_rx_task(void *arg)
@@ -881,11 +963,11 @@ static void stm_rx_task(void *arg)
         }
 
         if (xSemaphoreTake(g_uart_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(8));
             continue;
         }
 
-        const int len = uart_read_bytes(STM_UART_NUM, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(80));
+        const int len = uart_read_bytes(STM_UART_NUM, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(25));
         xSemaphoreGive(g_uart_mutex);
 
         for (int i = 0; i < len; ++i) {
@@ -912,6 +994,10 @@ static void stm_rx_task(void *arg)
 
             line_buf[line_len++] = isprint((unsigned char)c) ? c : '.';
         }
+
+        /* Leave scheduler room so web handlers can lock UART for commands. */
+        stm_debug_sync_poll();
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
